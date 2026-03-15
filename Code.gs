@@ -39,14 +39,20 @@ function cleanBuggedData() {
   const heroIdx = data[0].indexOf("Hero Total");
   if (compIdx === -1 || heroIdx === -1) return;
 
+  const goodRows = [data[0]];
   let deletedCount = 0;
-  for (let i = data.length - 1; i > 0; i--) {
+  for (let i = 1; i < data.length; i++) {
     let pct = parseFloat(data[i][compIdx]);
     let heroStr = String(data[i][heroIdx]);
     if (pct > 100 || heroStr.includes("/305")) {
-      sheet.deleteRow(i + 1);
       deletedCount++;
+    } else {
+      goodRows.push(data[i]);
     }
+  }
+  if (deletedCount > 0) {
+    sheet.clearContents();
+    sheet.getRange(1, 1, goodRows.length, goodRows[0].length).setValues(goodRows);
   }
   console.log(`Successfully cleaned ${deletedCount} corrupted rows.`);
 }
@@ -83,11 +89,24 @@ function syncClanData() {
   const responses = UrlFetchApp.fetchAll(requests);
   const now = new Date();
 
+  // Pre-read Activity_Logs sheet once to avoid a full sheet read per player
+  const activitySheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Activity_Logs");
+  const activitySheetData = activitySheet.getDataRange().getValues();
+  const activityTagIndex = new Map();
+  for (let i = 1; i < activitySheetData.length; i++) {
+    if (activitySheetData[i][0]) activityTagIndex.set(activitySheetData[i][0], {
+      rowIndex: i + 1,
+      lastSeen: activitySheetData[i][2], donations: activitySheetData[i][3],
+      received: activitySheetData[i][4], attacks: activitySheetData[i][5],
+      score: activitySheetData[i][6] || 0
+    });
+  }
+
   responses.forEach(res => {
     if (res.getResponseCode() === 200) {
       const playerData = JSON.parse(res.getContentText());
       processOfficialApiData(playerData, now);
-      updateActivityLog(playerData, now);
+      updateActivityLog(playerData, now, activitySheet, activityTagIndex);
     }
   });
 
@@ -143,28 +162,25 @@ function updateDataSheet(tag, extractedLevels) {
   if (!headers[0]) headers = [];
   requiredHeaders.forEach(req => { if (headers.indexOf(req) === -1) { headers.push(req); sheet.getRange(1, headers.length).setValue(req); } });
 
-  let targetRow = sheet.getLastRow() + 1;
-  sheet.getRange(targetRow, 1).setValue(tag);
-  for (let colIndex = 1; colIndex < headers.length; colIndex++) {
-    if (extractedLevels[headers[colIndex]] !== undefined) sheet.getRange(targetRow, colIndex + 1).setValue(extractedLevels[headers[colIndex]]);
-  }
+  const newRow = headers.map((h, i) => i === 0 ? tag : (extractedLevels[h] !== undefined ? extractedLevels[h] : ""));
+  sheet.getRange(sheet.getLastRow() + 1, 1, 1, newRow.length).setValues([newRow]);
 }
 
-function updateActivityLog(playerData, now) {
-  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Activity_Logs");
+function updateActivityLog(playerData, now, sheet, activityTagIndex) {
   const timelineSheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Activity_Timeline");
-  const tag = playerData.tag; const dataRange = sheet.getDataRange().getValues(); let rowIndex = -1;
-  for (let i = 1; i < dataRange.length; i++) { if (dataRange[i][0] === tag) { rowIndex = i + 1; break; } }
+  const tag = playerData.tag;
   const currentStats = { donations: playerData.donations || 0, received: playerData.donationsReceived || 0, attacks: playerData.attackWins || 0 };
 
-  if (rowIndex === -1) {
+  const existing = activityTagIndex.get(tag);
+  if (!existing) {
     sheet.appendRow([tag, playerData.name, now.getTime(), currentStats.donations, currentStats.received, currentStats.attacks, 1]);
+    activityTagIndex.set(tag, { rowIndex: sheet.getLastRow(), lastSeen: now.getTime(), donations: currentStats.donations, received: currentStats.received, attacks: currentStats.attacks, score: 1 });
     if(timelineSheet) timelineSheet.appendRow([now.getTime()]);
   } else {
-    const prev = { lastSeen: dataRange[rowIndex-1][2], donations: dataRange[rowIndex-1][3], received: dataRange[rowIndex-1][4], attacks: dataRange[rowIndex-1][5], score: dataRange[rowIndex-1][6] || 0 };
+    const prev = { lastSeen: existing.lastSeen, donations: existing.donations, received: existing.received, attacks: existing.attacks, score: existing.score };
     let hasChanged = (currentStats.donations !== prev.donations) || (currentStats.received !== prev.received) || (currentStats.attacks !== prev.attacks);
     let newLastSeen = hasChanged ? now.getTime() : prev.lastSeen; let newScore = hasChanged ? prev.score + 1 : prev.score;
-    sheet.getRange(rowIndex, 1, 1, 7).setValues([[tag, playerData.name, newLastSeen, currentStats.donations, currentStats.received, currentStats.attacks, newScore]]);
+    sheet.getRange(existing.rowIndex, 1, 1, 7).setValues([[tag, playerData.name, newLastSeen, currentStats.donations, currentStats.received, currentStats.attacks, newScore]]);
 
     if (hasChanged && timelineSheet) timelineSheet.appendRow([now.getTime()]);
   }
@@ -233,10 +249,11 @@ function fetchWarData(options) {
                 let p = enemyAttackPatterns[clan.tag];
                 let oppClan = clan.tag === wData.clan.tag ? wData.opponent : wData.clan;
 
+                const oppMemberMap = new Map((oppClan.members || []).map(d => [d.tag, d]));
                 (clan.members || []).forEach(m => {
                   if (m.attacks) {
                     m.attacks.forEach(atk => {
-                      let defender = (oppClan.members || []).find(d => d.tag === atk.defenderTag);
+                      let defender = oppMemberMap.get(atk.defenderTag);
                       if (defender) {
                         p.total++;
                         if (atk.stars === 3) p.threeStars++;
@@ -344,7 +361,11 @@ function getDashboardData() {
   let cwlHistoryArray = [];
   try {
     let cwlDbData = ss.getSheetByName("CWL_History").getDataRange().getValues();
-    for (let i = 0; i < cwlDbData.length; i++) { if (cwlDbData[i][1]) cwlHistoryArray.push(JSON.parse(cwlDbData[i][1])); }
+    for (let i = 0; i < cwlDbData.length; i++) {
+      if (cwlDbData[i][1]) {
+        try { cwlHistoryArray.push(JSON.parse(cwlDbData[i][1])); } catch(parseErr) { console.warn(`Skipping malformed CWL record at row ${i + 1}`); }
+      }
+    }
   } catch(e) {}
   cwlHistoryArray.reverse();
 
@@ -378,14 +399,18 @@ function getDashboardData() {
 
   let playerMap = {};
   const headers = dataSheet[0];
-  const tagIdx = 0; const nameIdx = headers.indexOf("Username"); const tsIdx = headers.indexOf("Timestamp"); const compIdx = headers.indexOf("Completion %");
+  // Pre-index headers once to avoid O(n) indexOf calls inside every player iteration
+  const headerMap = {};
+  headers.forEach((h, i) => { headerMap[h] = i; });
+  const tagIdx = 0; const nameIdx = headerMap["Username"] ?? -1; const tsIdx = headerMap["Timestamp"] ?? -1; const compIdx = headerMap["Completion %"] ?? -1;
 
   for (let i = 1; i < dataSheet.length; i++) {
     const row = dataSheet[i]; const tag = row[tagIdx]; if (!tag || tag === "Tag") continue;
     const ts = tsIdx > -1 && row[tsIdx] ? row[tsIdx] : 0;
     const dateLabel = ts > 0 ? Utilities.formatDate(new Date(ts), Session.getScriptTimeZone(), "MM/dd/yy") : "";
     if (!playerMap[tag]) playerMap[tag] = { tag: tag, history: [], latestTs: 0 };
-    playerMap[tag].history.push({ date: dateLabel, pct: parseFloat(row[compIdx]) || 0, ts: ts, rawRow: row });
+    // Store row index instead of the full row array to reduce memory usage
+    playerMap[tag].history.push({ date: dateLabel, pct: parseFloat(row[compIdx]) || 0, ts: ts, rowIdx: i });
     if (ts >= playerMap[tag].latestTs || playerMap[tag].latestTs === 0) playerMap[tag].latestTs = ts;
   }
 
@@ -399,13 +424,14 @@ function getDashboardData() {
 
   for (let key in playerMap) {
     let p = playerMap[key]; p.history.sort((a, b) => a.ts - b.ts);
-    let row = p.history[p.history.length - 1].rawRow; let prevRow = p.history.length > 1 ? p.history[p.history.length - 2].rawRow : row;
+    let latestEntry = p.history[p.history.length - 1]; let prevEntry = p.history.length > 1 ? p.history[p.history.length - 2] : latestEntry;
+    let row = dataSheet[latestEntry.rowIdx]; let prevRow = dataSheet[prevEntry.rowIdx];
     p.history.forEach(h => { if (!uniqueDatesMap[h.date] || h.ts > uniqueDatesMap[h.date]) uniqueDatesMap[h.date] = h.ts; });
     let chartHistory = p.history.filter(h => h.ts >= thirtyDaysAgo); if (chartHistory.length === 0 && p.history.length > 0) chartHistory.push(p.history[p.history.length - 1]);
     let act = activityMap[key] || { lastSeenTs: 0, activityScore: 0 }; let cap = capitalMap[key] || { attacks: 0, limit: 6, looted: 0 };
 
-    let donations = headers.indexOf("Donations") > -1 ? parseInt(row[headers.indexOf("Donations")]) || 0 : 0;
-    let received = headers.indexOf("Donations Received") > -1 ? parseInt(row[headers.indexOf("Donations Received")]) || 0 : 0;
+    let donations = headerMap["Donations"] !== undefined ? parseInt(row[headerMap["Donations"]]) || 0 : 0;
+    let received = headerMap["Donations Received"] !== undefined ? parseInt(row[headerMap["Donations Received"]]) || 0 : 0;
     clanTotalDonations += donations;
     clanTotalReceived += received;
 
@@ -413,18 +439,18 @@ function getDashboardData() {
 
     let playerObj = {
       name: nameIdx > -1 && row[nameIdx] ? row[nameIdx] : p.tag, tag: p.tag,
-      thLevel: headers.indexOf("TH") > -1 ? parseInt(row[headers.indexOf("TH")]) : 0, 
+      thLevel: headerMap["TH"] !== undefined ? parseInt(row[headerMap["TH"]]) : 0,
       percentage: parseFloat((row[compIdx] || 0).toString()).toFixed(2), prevPct: parseFloat((prevRow[compIdx] || 0).toString()).toFixed(2),
-      heroStats: headers.indexOf("Hero Total") > -1 ? row[headers.indexOf("Hero Total")] : "0/465", petStats: headers.indexOf("Pet Total") > -1 ? row[headers.indexOf("Pet Total")] : "0/105",
-      labStats: headers.indexOf("Lab Total") > -1 ? row[headers.indexOf("Lab Total")] : 0,
-      donations: donations, donationsReceived: received, warStars: headers.indexOf("War Stars") > -1 ? row[headers.indexOf("War Stars")] : 0,
+      heroStats: headerMap["Hero Total"] !== undefined ? row[headerMap["Hero Total"]] : "0/465", petStats: headerMap["Pet Total"] !== undefined ? row[headerMap["Pet Total"]] : "0/105",
+      labStats: headerMap["Lab Total"] !== undefined ? row[headerMap["Lab Total"]] : 0,
+      donations: donations, donationsReceived: received, warStars: headerMap["War Stars"] !== undefined ? row[headerMap["War Stars"]] : 0,
       lastSeenTs: act.lastSeenTs, activityScore: act.activityScore, capitalAttacks: `${cap.attacks}/${cap.limit}`, capitalLooted: cap.looted,
       cwlStats: cwlStats, 
       historyDates: chartHistory.map(h => h.date), historyPcts: chartHistory.map(h => h.pct),
       heroes: {}, pets: {}, upgrades: [], recentlyCompleted: []
     };
 
-    const getLvl = (r, name) => { let idx = headers.indexOf(name); return idx > -1 ? parseInt(r[idx]) || 0 : 0; };
+    const getLvl = (r, name) => { let idx = headerMap[name] ?? -1; return idx > -1 ? parseInt(r[idx]) || 0 : 0; };
     
     heroNames.forEach(h => { playerObj.heroes[h] = getLvl(row, h); if(playerObj.heroes[h] > getLvl(prevRow, h)) playerObj.recentlyCompleted.push(`${h} to Lvl ${playerObj.heroes[h]}`); });
     petNames.forEach(pet => { playerObj.pets[pet] = getLvl(row, pet); if(playerObj.pets[pet] > getLvl(prevRow, pet)) playerObj.recentlyCompleted.push(`${pet} to Lvl ${playerObj.pets[pet]}`); });
@@ -434,8 +460,8 @@ function getDashboardData() {
   results.sort((a, b) => b.percentage - a.percentage);
   let clanTotalHeroes = 0, clanMaxHeroes = 0; let clanTotalPets = 0, clanMaxPets = 0;
   results.forEach(p => {
-    clanTotalHeroes += parseInt((p.heroStats || "0/465").split('/')[0]) || 0; clanMaxHeroes += parseInt((p.heroStats || "0/465").split('/')[1]) || 465;
-    clanTotalPets += parseInt((p.petStats || "0/105").split('/')[0]) || 0; clanMaxPets += parseInt((p.petStats || "0/105").split('/')[1]) || 105;
+    let heroParts = (p.heroStats || "0/465").split('/'); clanTotalHeroes += parseInt(heroParts[0]) || 0; clanMaxHeroes += parseInt(heroParts[1]) || 465;
+    let petParts = (p.petStats || "0/105").split('/'); clanTotalPets += parseInt(petParts[0]) || 0; clanMaxPets += parseInt(petParts[1]) || 105;
   });
 
   let uniqueDatesArray = Object.keys(uniqueDatesMap).map(date => ({ label: date, ts: uniqueDatesMap[date] })).sort((a, b) => a.ts - b.ts);
